@@ -35,7 +35,7 @@ FlightRisk addresses this problem by providing a user-friendly interface that di
     *   Backend: `Python`
     *   Mapping Library: `Plotly`
 *   **Architecture:**  
-<img src="./images/final_implementation.png" width="500" alt="Description of image">
+<img src="./images/final_implementation.png" width="800" alt="System Architecture" style="background-color: white;">
 
 ## Setup and Installation
 
