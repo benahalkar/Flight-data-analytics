@@ -1,36 +1,60 @@
-from FlightRadar24 import FlightRadar24API
+import os
+import math
+import json
+import re
+from datetime import datetime
+
+import requests
+import pandas as pd
 import plotly.graph_objects as go
 from dash import Dash, dcc, html, Input, Output, dash_table
 import dash_bootstrap_components as dbc
 from dash_bootstrap_templates import load_figure_template
-import pandas as pd
-from datetime import datetime
-import os
-import requests
-from pyspark.sql import Row
+from pyspark.sql import SparkSession, Row
 from pyspark.sql.functions import col, lit, udf, size
-from pyspark.sql.types import StructType, StructField, StringType, TimestampType, IntegerType, FloatType, ArrayType, BooleanType
-import json
-from pyspark.sql import SparkSession
-import regex as re
-import math
+from pyspark.sql.types import (StructType, StructField, StringType,
+                                 TimestampType, IntegerType, FloatType,
+                                 ArrayType, BooleanType)
+from FlightRadar24 import FlightRadar24API
 
-spark = SparkSession.builder.appName("example").getOrCreate()
-folder_path = os.path.join('./', "dat_files")
-column_names = ["Airport ID", "Name of airport", "City", "Country", "IATA", "ICAO", "Latitude",
-                "Longitude", "Altitude", "Timezone", "DST", "Tz database timezone", "Type", "Source"]
-airport_df = pd.read_csv(folder_path + "/" + "airports.dat",
-                         delimiter=',', names=column_names)
-airport_df = airport_df.drop(columns=["Type", "Source"])
-airport_codes = [
-    "ATL", "DFW", "DEN", "ORD", "DXB", "LAX", "IST", "LHR", "DEL", "CDG", "JFK", "LAS",
-    "AMS", "MIA", "MAD", "HND", "MCO", "FRA", "CLT", "MEX", "SEA", "PHX", "EWR", "SFO",
-    "BCN", "IAH", "CGK", "BOM", "YYZ", "BOS", "DOH", "BOG", "GRU", "SGN", "LGW", "SIN",
-    "FLL", "JED", "MUC", "AYT", "SAW", "MSP", "CUN", "MNL", "CJU", "FCO", "ORY", "SYD",
-    "LGA", "BKK"
+
+# Initialize FlightRadar24 API
+flight_api = FlightRadar24API()
+
+# Initialize Spark Session
+spark = SparkSession.builder.appName("flight_tracker").getOrCreate()
+
+# Define folder path for data files
+FOLDER_PATH = os.path.join("./", "dat_files")
+
+# Define column names for the airport data
+AIRPORT_COLUMN_NAMES = [
+    "Airport ID", "Name of airport", "City", "Country", "IATA", "ICAO",
+    "Latitude", "Longitude", "Altitude", "Timezone", "DST",
+    "Tz database timezone", "Type", "Source"
 ]
 
-airport_dict = {
+# Load airport data from CSV
+AIRPORT_DF = pd.read_csv(
+    os.path.join(FOLDER_PATH, "airports.dat"),
+    delimiter=",",
+    names=AIRPORT_COLUMN_NAMES
+)
+
+# Drop unnecessary columns
+AIRPORT_DF = AIRPORT_DF.drop(columns=["Type", "Source"])
+
+# Define a list of common airport codes
+AIRPORT_CODES = [
+    "ATL", "DFW", "DEN", "ORD", "DXB", "LAX", "IST", "LHR", "DEL", "CDG",
+    "JFK", "LAS", "AMS", "MIA", "MAD", "HND", "MCO", "FRA", "CLT", "MEX",
+    "SEA", "PHX", "EWR", "SFO", "BCN", "IAH", "CGK", "BOM", "YYZ", "BOS",
+    "DOH", "BOG", "GRU", "SGN", "LGW", "SIN", "FLL", "JED", "MUC", "AYT",
+    "SAW", "MSP", "CUN", "MNL", "CJU", "FCO", "ORY", "SYD", "LGA", "BKK"
+]
+
+# Define a dictionary mapping airport names to IATA codes
+AIRPORT_DICT = {
     "Hartsfield-Jackson Atlanta International": "ATL",
     "Dallas/Fort Worth International": "DFW",
     "Denver International": "DEN",
@@ -83,43 +107,81 @@ airport_dict = {
     "Suvarnabhumi": "BKK"
 }
 
-airport_options = [{'label': key, 'value': value}
-                   for key, value in airport_dict.items()]
-
-flight_api = FlightRadar24API()
-
-# Functions
+# Create a list of dictionaries for airport dropdown options
+AIRPORT_OPTIONS = [
+    {"label": key, "value": value} for key, value in AIRPORT_DICT.items()
+]
 
 
-def get_col_name(x): return x.replace(".", "_")
+# Utility Functions
+def get_col_name(column_name: str) -> str:
+    """Replace dots in column names with underscores.
+
+    Args:
+        column_name (str): The original column name.
+
+    Returns:
+        str: The modified column name.
+    """
+    return column_name.replace(".", "_")
 
 
-def cleanup_df(df, column):
+def cleanup_df(df, column: str):
+    """Remove rows with NaN values in the specified column.
+
+    Args:
+        df: The DataFrame to clean.
+        column (str): The column to check for NaN values.
+
+    Returns:
+        The cleaned DataFrame.
+    """
     previous_count = df.count()
     df = df.filter(df[column] != "NaN")
     df = df.na.drop(subset=[column])
     next_count = df.count()
-    print("Before - {}, after - {}, difference - {}, %loss - {}".format(previous_count,
-          next_count, previous_count - next_count, (previous_count - next_count)*100.0/previous_count))
+    print("Before - {}, after - {}, difference - {}, %loss - {}".format(
+        previous_count, next_count, previous_count - next_count,
+        (previous_count - next_count) * 100.0 / previous_count
+    ))
     return df
 
 
-def check_valid_code(airport_iata):
-    selected_values = airport_df.loc[airport_df['IATA']
-                                     == airport_iata, 'Latitude'].values.tolist()
-    return True if len(selected_values) == 1 else False
+def check_valid_code(airport_iata: str) -> bool:
+    """Check if the given IATA code is a valid airport code.
+
+    Args:
+        airport_iata (str): The IATA code to validate.
+
+    Returns:
+        bool: True if the code is valid, False otherwise.
+    """
+    selected_values = AIRPORT_DF.loc[
+        AIRPORT_DF["IATA"] == airport_iata, "Latitude"].values.tolist()
+    return len(selected_values) == 1
 
 
-def get_flights_from_airport(airport_iata):
-    if check_valid_code(airport_iata) is False:
+def get_flights_from_airport(airport_iata: str):
+    """Retrieve flight schedules (arrivals and departures) for a given airport.
+
+    Args:
+        airport_iata (str): The IATA code of the airport.
+
+    Returns:
+        A Pandas DataFrame containing flight schedules or None if the IATA code is invalid.
+    """
+    if not check_valid_code(airport_iata):
         return None
 
     airport_details = flight_api.get_airport_details(code=airport_iata)
-    keys = ["flight.identification.id", "flight.identification.callsign", "flight.airline.name", "flight.airport.origin",
-            "flight.airport.destination", "flight.time.scheduled", "flight.time.real", "flight.time.estimated"]
+    keys = [
+        "flight.identification.id", "flight.identification.callsign",
+        "flight.airline.name", "flight.airport.origin",
+        "flight.airport.destination", "flight.time.scheduled",
+        "flight.time.real", "flight.time.estimated"
+    ]
 
     arr_details = airport_details["airport"]["pluginData"]["schedule"]["arrivals"]["data"]
-
     arr_df = spark.createDataFrame(arr_details)
     arr_df = arr_df.withColumn("Flight_type", lit("arrivals"))
 
@@ -127,20 +189,31 @@ def get_flights_from_airport(airport_iata):
         arr_df = arr_df.withColumn(key.replace(".", "_"), col(key))
 
     dept_details = airport_details["airport"]["pluginData"]["schedule"]["departures"]["data"]
-
     dept_df = spark.createDataFrame(dept_details)
     dept_df = dept_df.withColumn("Flight_type", lit("departures"))
 
     for key in keys:
         dept_df = dept_df.withColumn(key.replace(".", "_"), col(key))
+
     df = dept_df.union(arr_df)
     df = df.toPandas()
     return df
 
 
 def get_points_along_flight_path(start_coord, end_coord, num_points, start_time, end_time):
-    start_lat, start_lon = math.radians(
-        start_coord[0]), math.radians(start_coord[1])
+    """Generate intermediate points along a great-circle path between two coordinates.
+
+    Args:
+        start_coord (tuple): (latitude, longitude) of the starting point.
+        end_coord (tuple): (latitude, longitude) of the ending point.
+        num_points (int): Number of intermediate points to generate.
+        start_time (int): Unix timestamp of the start time.
+        end_time (int): Unix timestamp of the end time.
+
+    Returns:
+        list: A list of dictionaries, each containing 'lat', 'lon', and 'time' for a point.
+    """
+    start_lat, start_lon = math.radians(start_coord[0]), math.radians(start_coord[1])
     end_lat, end_lon = math.radians(end_coord[0]), math.radians(end_coord[1])
 
     points = []
@@ -149,14 +222,25 @@ def get_points_along_flight_path(start_coord, end_coord, num_points, start_time,
         intermediate_lat = start_lat + fraction * (end_lat - start_lat)
         intermediate_lon = start_lon + fraction * (end_lon - start_lon)
         intermediate_time = start_time + fraction * (end_time - start_time)
-        intermediate_point = {"lat": round(math.degrees(intermediate_lat), 5), "lon": round(
-            math.degrees(intermediate_lon), 5), "time": int(intermediate_time)}
+        intermediate_point = {
+            "lat": round(math.degrees(intermediate_lat), 5),
+            "lon": round(math.degrees(intermediate_lon), 5),
+            "time": int(intermediate_time)
+        }
         points.append(intermediate_point)
 
     return points
 
 
-def get_flight_details(flight_id):
+def get_flight_details(flight_id: str) -> dict:
+    """Retrieve detailed information about a specific flight.
+
+    Args:
+        flight_id (str): The ID of the flight.
+
+    Returns:
+        dict: A dictionary containing flight details.
+    """
     details = flight_api.get_flight_details(flight_id)
 
     data = {}
@@ -211,29 +295,28 @@ def get_flight_details(flight_id):
     data["trail"] = df.toJSON().collect()
 
     latest_data = details["trail"][0]
-    data["future_path"] = get_points_along_flight_path((latest_data["lat"], latest_data["lng"]),
-                                                       (data["destination_airport_lat"],
-                                                        data["destination_airport_lon"]),
-                                                       10,
-                                                       latest_data["ts"], data["scheduled_arrival_time"])
+    data["future_path"] = get_points_along_flight_path(
+        (latest_data["lat"], latest_data["lng"]),
+        (data["destination_airport_lat"], data["destination_airport_lon"]),
+        10,
+        latest_data["ts"], data["scheduled_arrival_time"]
+    )
 
     return data
 
 
+# Dash App
 app = Dash(external_stylesheets=[dbc.themes.DARKLY])
-load_figure_template('DARKLY')
+load_figure_template("DARKLY")
 
-tabs_styles = {
-    'height': '44px'
-}
-tab_style = {
+TABS_STYLES = {'height': '44px'}
+TAB_STYLE = {
     'borderBottom': '1px solid #d6d6d6',
     'padding': '6px',
     'fontWeight': 'bold',
     'backgroundColor': '#222222'
 }
-
-tab_selected_style = {
+TAB_SELECTED_STYLE = {
     'borderTop': '1px solid #d6d6d6',
     'borderBottom': '1px solid #d6d6d6',
     'backgroundColor': '#119DFF',
@@ -243,35 +326,65 @@ tab_selected_style = {
 
 app.layout = html.Div([
     dcc.Tabs([
-        dcc.Tab(label="Future Flight Planner", children=[
-            html.H1(children='Flights Map', style={'textAlign': 'center'}),
-            dcc.Graph(id='live-update-map',
-                      style={'height': '100vh', 'width': '100vw'}),
-            dcc.Interval(id='interval-component',
-                         interval=60*60*1000, n_intervals=0)
-        ], style=tab_style, selected_style=tab_selected_style),
-        dcc.Tab(label="Individual Flight Tracker", children=[
-            html.H1(children="Individual Flight Tracker",
-                    style={'textAlign': 'center'}),
-            html.Br(),
-            dcc.Dropdown(airport_options, id='airport_dropdown',
-                         className='darkly-dropdown', style={'background-color': 'blue'}),
-            html.Br(),
-            dash_table.DataTable(id='flight_table', columns=[], data=[], page_action='none', style_table={
-                                 'height': '300px', 'overflowY': 'auto'}, style_cell={'background-color': '#222222', 'font-family': 'monospace', 'textAlign': 'center'}),
-            html.Br(),
-            dcc.Dropdown(id='flight_dropdown', className='darkly-dropdown'),
-            dcc.Graph(id='flight_output', style={'width': '100vw'})
-        ], style=tab_style, selected_style=tab_selected_style)
-    ], style=tabs_styles)
+        dcc.Tab(
+            label="Future Flight Planner",
+            children=[
+                html.H1(children='Flights Map', style={'textAlign': 'center'}),
+                dcc.Graph(id='live-update-map', style={'height': '100vh', 'width': '100vw'}),
+                dcc.Interval(id='interval-component', interval=60 * 60 * 1000, n_intervals=0)
+            ],
+            style=TAB_STYLE,
+            selected_style=TAB_SELECTED_STYLE
+        ),
+        dcc.Tab(
+            label="Individual Flight Tracker",
+            children=[
+                html.H1(children="Individual Flight Tracker", style={'textAlign': 'center'}),
+                html.Br(),
+                dcc.Dropdown(
+                    AIRPORT_OPTIONS,
+                    id='airport_dropdown',
+                    className='darkly-dropdown',
+                    style={'background-color': 'blue'}
+                ),
+                html.Br(),
+                dash_table.DataTable(
+                    id='flight_table',
+                    columns=[],
+                    data=[],
+                    page_action='none',
+                    style_table={'height': '300px', 'overflowY': 'auto'},
+                    style_cell={
+                        'background-color': '#222222',
+                        'font-family': 'monospace',
+                        'textAlign': 'center'
+                    }
+                ),
+                html.Br(),
+                dcc.Dropdown(id='flight_dropdown', className='darkly-dropdown'),
+                dcc.Graph(id='flight_output', style={'width': '100vw'})
+            ],
+            style=TAB_STYLE,
+            selected_style=TAB_SELECTED_STYLE
+        )
+    ], style=TABS_STYLES)
 ])
 
 
+# Callbacks
 @app.callback(
     Output('live-update-map', 'figure'),
     Input('interval-component', 'n_intervals')
 )
 def format_csv_and_plot(n):
+    """Update the live map with flight paths and weather data.
+
+    Args:
+        n (int): The number of times the interval has passed (used to trigger the update).
+
+    Returns:
+        plotly.graph_objects.Figure: A Plotly figure showing flight paths and airport locations.
+    """
     df = pd.read_csv('test.csv')
 
     # Format Columns
@@ -285,67 +398,62 @@ def format_csv_and_plot(n):
         lambda x: ["red" if j >= 90 else ("orange" if j >= 75 else "white") for j in x])
 
     # Get Airports
-    dept_airport_names = df.groupby('departure_airport')[
-        'departure_lat'].first().index.tolist()
-    dept_aiport_lat = df.groupby('departure_airport')[
-        'departure_lat'].first().tolist()
-    dept_aiport_lon = df.groupby('departure_airport')[
-        'departure_lon'].first().tolist()
+    dept_airport_names = df.groupby('departure_airport')['departure_lat'].first().index.tolist()
+    dept_aiport_lat = df.groupby('departure_airport')['departure_lat'].first().tolist()
+    dept_aiport_lon = df.groupby('departure_airport')['departure_lon'].first().tolist()
 
     # Arrival Airports
-    arr_airport_names = df.groupby('arrival_airport')[
-        'arrival_lat'].first().index.tolist()
-    arr_aiport_lat = df.groupby('arrival_airport')[
-        'arrival_lat'].first().tolist()
-    arr_aiport_lon = df.groupby('arrival_airport')[
-        'arrival_lon'].first().tolist()
+    arr_airport_names = df.groupby('arrival_airport')['arrival_lat'].first().index.tolist()
+    arr_aiport_lat = df.groupby('arrival_airport')['arrival_lat'].first().tolist()
+    arr_aiport_lon = df.groupby('arrival_airport')['arrival_lon'].first().tolist()
 
-    flight_details = df[['flight_path', 'weather_data',
-                         'flight_iata', 'arrival_epoch', 'departure_epoch']]
+    flight_details = df[['flight_path', 'weather_data', 'flight_iata', 'arrival_epoch', 'departure_epoch']]
     fig = go.Figure(go.Scattergeo())
     for index, row in flight_details.iterrows():
         path = row['flight_path']
         risk_colors = row['weather_data']
         flight_number = row['flight_iata']
-        arrival_time = datetime.fromtimestamp(
-            int(row['arrival_epoch'])).strftime("%Y-%m-%d %H:%M:%S")
-        departure_time = datetime.fromtimestamp(
-            int(row['departure_epoch'])).strftime("%Y-%m-%d %H:%M:%S")
+        arrival_time = datetime.fromtimestamp(int(row['arrival_epoch'])).strftime("%Y-%m-%d %H:%M:%S")
+        departure_time = datetime.fromtimestamp(int(row['departure_epoch'])).strftime("%Y-%m-%d %H:%M:%S")
         txt = f"Flight: {flight_number}<br>Departure Time: {departure_time}<br>Arrival Time {arrival_time}"
-        fig.add_trace(go.Scattergeo(lat=[p[0] for p in path],
-                                    lon=[p[1] for p in path],
-                                    mode='markers + lines',
-                                    showlegend=False,
-                                    line=dict(color='white', width=0.5),
-                                    marker=dict(color=risk_colors, size=7),
-                                    text=txt,
-                                    hoverinfo='text'
-                                    )
-                      )
-    fig.add_trace(go.Scattergeo(lat=dept_aiport_lat,
-                                lon=dept_aiport_lon,
-                                showlegend=False,
-                                marker=dict(
-                                    color="#ba1fbf", symbol='square', size=7),
-                                hoverinfo="text",
-                                text=dept_airport_names))
+        fig.add_trace(go.Scattergeo(
+            lat=[p[0] for p in path],
+            lon=[p[1] for p in path],
+            mode='markers + lines',
+            showlegend=False,
+            line=dict(color='white', width=0.5),
+            marker=dict(color=risk_colors, size=7),
+            text=txt,
+            hoverinfo='text'
+        ))
+    fig.add_trace(go.Scattergeo(
+        lat=dept_aiport_lat,
+        lon=dept_aiport_lon,
+        showlegend=False,
+        marker=dict(color="#ba1fbf", symbol='square', size=7),
+        hoverinfo="text",
+        text=dept_airport_names
+    ))
 
-    fig.add_trace(go.Scattergeo(lat=arr_aiport_lat,
-                                lon=arr_aiport_lon,
-                                showlegend=False,
-                                marker=dict(
-                                    color="#ba1fbf", symbol='square', size=7),
-                                hoverinfo="text",
-                                text=arr_airport_names))
+    fig.add_trace(go.Scattergeo(
+        lat=arr_aiport_lat,
+        lon=arr_aiport_lon,
+        showlegend=False,
+        marker=dict(color="#ba1fbf", symbol='square', size=7),
+        hoverinfo="text",
+        text=arr_airport_names
+    ))
 
-    fig.update_layout(geo_showland=True,
-                      geo_showsubunits=True,
-                      geo_landcolor="#45bf1f",
-                      geo_showcountries=True,
-                      geo_countrycolor='Black',
-                      geo_showocean=True,
-                      geo_oceancolor="DarkBlue",
-                      geo_projection_type="orthographic")
+    fig.update_layout(
+        geo_showland=True,
+        geo_showsubunits=True,
+        geo_landcolor="#45bf1f",
+        geo_showcountries=True,
+        geo_countrycolor='Black',
+        geo_showocean=True,
+        geo_oceancolor="DarkBlue",
+        geo_projection_type="orthographic"
+    )
     fig.update_layout(margin={"r": 0, "t": 0, "l": 0, "b": 0})
     return fig
 
@@ -357,34 +465,42 @@ def format_csv_and_plot(n):
     Input('airport_dropdown', 'value')
 )
 def create_flight_schedule(value):
+    """Create and update the flight schedule table based on the selected airport.
+
+    Args:
+        value (str): The IATA code of the selected airport.
+
+    Returns:
+        tuple: A tuple containing the columns and data for the flight table,
+               and the options for the flight dropdown.
+    """
     if not value:
         return [], [], ["No Flights Available"]
     df = get_flights_from_airport(value)
     df = df.drop('flight', axis=1)
 
-    result_df = {'Flight ID': [], 'Flight Number': [], 'Airline': [],
-                 'Origin': [], 'Departure Time': [], 'Arrival Time': []}
+    result_df = {
+        'Flight ID': [], 'Flight Number': [], 'Airline': [],
+        'Origin': [], 'Departure Time': [], 'Arrival Time': []
+    }
     for index, row in df.iterrows():
         if not row['flight_identification_id']:
             continue
         if row['Flight_type'] == 'departures':
             continue
         result_df['Flight ID'].append(row['flight_identification_id'])
-        result_df['Flight Number'].append(
-            row['flight_identification_callsign'])
+        result_df['Flight Number'].append(row['flight_identification_callsign'])
         result_df['Airline'].append(row['flight_airline_name'])
         orig = row['flight_airport_origin']
         origin_airport_name = re.search(r'^(.+?),', orig).group()[6:-1]
         result_df['Origin'].append(origin_airport_name)
         times = row['flight_time_scheduled']
-        arrival_time = re.search(
-            r'\d+', re.search(r'a(.+?),', times).group()).group()
-        departure_time = re.search(
-            r'\d+', re.search(r'd(.+?)}', times).group()).group()
-        result_df['Arrival Time'].append(datetime.fromtimestamp(
-            int(arrival_time)).strftime("%Y-%m-%d %H:%M:%S"))
-        result_df['Departure Time'].append(datetime.fromtimestamp(
-            int(departure_time)).strftime("%Y-%m-%d %H:%M:%S"))
+        arrival_time = re.search(r'\d+', re.search(r'a(.+?),', times).group()).group()
+        departure_time = re.search(r'\d+', re.search(r'd(.+?)}', times).group()).group()
+        result_df['Arrival Time'].append(
+            datetime.fromtimestamp(int(arrival_time)).strftime("%Y-%m-%d %H:%M:%S"))
+        result_df['Departure Time'].append(
+            datetime.fromtimestamp(int(departure_time)).strftime("%Y-%m-%d %H:%M:%S"))
 
     result_df = pd.DataFrame(result_df)
     columns = [{'name': col, 'id': col} for col in result_df.columns]
@@ -394,8 +510,7 @@ def create_flight_schedule(value):
     flight_mapper = {}
     for index, row in flight_map.iterrows():
         flight_mapper[row['Flight Number']] = row['Flight ID']
-    flights = [{'label': key, 'value': value}
-               for key, value in flight_mapper.items()]
+    flights = [{'label': key, 'value': value} for key, value in flight_mapper.items()]
     return columns, data, flights
 
 
@@ -404,12 +519,20 @@ def create_flight_schedule(value):
     Input('flight_dropdown', 'value')
 )
 def plot_graph(value):
+    """Plot the flight path of a selected flight.
+
+    Args:
+        value (str): The ID of the selected flight.
+
+    Returns:
+        plotly.graph_objects.Figure: A Plotly figure showing the flight path,
+               including previous and future paths, and airport locations.
+    """
     if not value:
         return go.Figure(go.Scattergeo())
     flight = get_flight_details(value)
     start_pt = (flight['origin_airport_lat'], flight['origin_airport_lon'])
-    end_pt = (flight['destination_airport_lat'],
-              flight['destination_airport_lon'])
+    end_pt = (flight['destination_airport_lat'], flight['destination_airport_lon'])
     trail = flight['trail']
     prev_path = [(eval(l)['lat'], eval(l)['lng']) for l in trail]
     cur_location = prev_path[0]
@@ -467,15 +590,19 @@ def plot_graph(value):
         text="Current Location"
     ))
 
-    fig.update_layout(autosize=True, geo_center=dict(
-        lat=cur_location[0], lon=cur_location[1]), geo_projection_scale=25, geo_showland=True,
+    fig.update_layout(
+        autosize=True,
+        geo_center=dict(lat=cur_location[0], lon=cur_location[1]),
+        geo_projection_scale=25,
+        geo_showland=True,
         geo_showsubunits=True,
         geo_subunitcolor='Black',
         geo_landcolor="#45bf1f",
         geo_showcountries=True,
         geo_countrycolor='Black',
         geo_showocean=True,
-        geo_oceancolor="DarkBlue")
+        geo_oceancolor="DarkBlue"
+    )
     fig.update_layout(margin={"r": 0, "t": 0, "l": 0, "b": 0})
 
     return fig
